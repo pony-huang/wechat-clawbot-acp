@@ -44,10 +44,20 @@ DEFAULT_AGENTS_CONFIG = Path(__file__).parent / "config" / "agents.json"
 
 def load_agents_config(config_path: Optional[Path] = None) -> dict:
     """Load agents configuration from JSON file."""
+    import platform
     path = config_path or DEFAULT_AGENTS_CONFIG
     if path.exists():
         with open(path) as f:
-            return json.load(f)
+            config = json.load(f)
+        # Cross-platform: use npx.cmd on Windows, npx on Linux/Mac
+        is_windows = platform.system() == "Windows"
+        for agent in config.get("agents", {}).values():
+            cmd = agent.get("command", "")
+            if is_windows and cmd == "npx":
+                agent["command"] = "npx.cmd"
+            elif not is_windows and cmd == "npx.cmd":
+                agent["command"] = "npx"
+        return config
     return {}
 
 
