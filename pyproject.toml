@@ -1,0 +1,30 @@
+[project]
+name = "wechat-clawbot-acp"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "agent-client-protocol>=0.9.0",
+    "qrcode>=8.2",
+    "pillow>=10.0.0",
+    "aiofiles>=23.0.0",
+    "pycryptodome>=3.19.0",
+    "aiohttp>=3.9.0",
+]
+
+[project.scripts]
+wca = "src.cli:main"
+
+[tool.wechat_clawbot_acp]
+ilink_appid = ""
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+exclude = ["openspec*", "node_modules*", "@*"]
+
+[tool.setuptools.package-data]
+src = ["config/*.json"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
