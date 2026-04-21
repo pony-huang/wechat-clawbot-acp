@@ -3,19 +3,29 @@
 Supports running the WeChat ACP bridge with configurable external ACP agents.
 
 Usage:
-    wca --agent "Claude Code"
-    wca --agent "Gemini CLI"
-    wca --agent "GitHub Copilot"
+    wca --agent "claude-acp"
+    wca --agent "gemini"
+    wca --agent "github-copilot-cli"
     wca --list-agents
     wca --cwd /path/to/dir
 """
 import argparse
 import asyncio
-import sys
 import json
 import os
+import platform
+import re
+import shutil
+import stat
+import sys
+import tarfile
+import tempfile
+import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+import aiohttp
 
 from src.channel_runtime_impl import build_default_channel_runtime
 from src.api.client import get_updates
@@ -35,36 +45,393 @@ from src.auth.login_qr import (
     start_weixin_login_with_qr,
     wait_for_weixin_login,
 )
+from src.storage.state_dir import resolve_state_dir
 from src.util.logger import logger
 
 
-# Default agents configuration path
 DEFAULT_AGENTS_CONFIG = Path(__file__).parent / "config" / "agents.json"
+DEFAULT_AGENT_ID = "claude-acp"
 
 
-def load_agents_config(config_path: Optional[Path] = None) -> dict:
-    """Load agents configuration from JSON file."""
-    import platform
+def _load_json_file(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _normalize_legacy_agents(agents: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    is_windows = platform.system() == "Windows"
+    for agent_id, agent in agents.items():
+        record = dict(agent)
+        command = record.get("command", "")
+        if is_windows and command == "npx":
+            record["command"] = "npx.cmd"
+        elif not is_windows and command == "npx.cmd":
+            record["command"] = "npx"
+        record.setdefault("id", agent_id)
+        record.setdefault("name", agent_id)
+        normalized[agent_id] = record
+    return normalized
+
+
+def _normalize_registry_agents(agents: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    for agent in agents:
+        agent_id = str(agent.get("id", "")).strip()
+        if not agent_id:
+            continue
+        normalized[agent_id] = agent
+    return normalized
+
+
+def load_agents_config(config_path: Optional[Path] = None) -> dict[str, Any]:
+    """Load agent configuration from JSON file."""
     path = config_path or DEFAULT_AGENTS_CONFIG
-    if path.exists():
-        with open(path) as f:
-            config = json.load(f)
-        # Cross-platform: use npx.cmd on Windows, npx on Linux/Mac
-        is_windows = platform.system() == "Windows"
-        for agent in config.get("agents", {}).values():
-            cmd = agent.get("command", "")
-            if is_windows and cmd == "npx":
-                agent["command"] = "npx.cmd"
-            elif not is_windows and cmd == "npx.cmd":
-                agent["command"] = "npx"
-        return config
-    return {}
+    if not path.exists():
+        return {"agents": {}}
+
+    config = _load_json_file(path)
+    agents = config.get("agents")
+    if isinstance(agents, list):
+        return {**config, "agents": _normalize_registry_agents(agents)}
+    if isinstance(agents, dict):
+        return {**config, "agents": _normalize_legacy_agents(agents)}
+    return {"agents": {}}
 
 
 def list_available_agents(config_path: Optional[Path] = None) -> list[str]:
-    """Get list of available agent names."""
+    """Get the list of available agent ids."""
     config = load_agents_config(config_path)
     return list(config.get("agents", {}).keys())
+
+
+def list_available_agent_entries(config_path: Optional[Path] = None) -> list[tuple[str, str]]:
+    """Get available agent ids with display names."""
+    config = load_agents_config(config_path)
+    entries: list[tuple[str, str]] = []
+    for agent_id, agent in config.get("agents", {}).items():
+        entries.append((agent_id, str(agent.get("name", agent_id))))
+    return entries
+
+
+def _detect_platform_key() -> str:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    if machine in {"amd64", "x86_64", "x64"}:
+        arch = "x86_64"
+    elif machine in {"arm64", "aarch64"}:
+        arch = "aarch64"
+    else:
+        raise RuntimeError(f"Unsupported architecture: {platform.machine()}")
+
+    if system == "darwin":
+        return f"darwin-{arch}"
+    if system == "linux":
+        return f"linux-{arch}"
+    if system == "windows":
+        return f"windows-{arch}"
+    raise RuntimeError(f"Unsupported operating system: {platform.system()}")
+
+
+def _normalize_spawn_command(command: str) -> str:
+    is_windows = platform.system() == "Windows"
+    if is_windows and command == "npx":
+        return "npx.cmd"
+    if is_windows and command == "npm":
+        return "npm.cmd"
+    if is_windows and command == "uvx":
+        return "uvx.exe"
+    if not is_windows and command == "npx.cmd":
+        return "npx"
+    if not is_windows and command == "npm.cmd":
+        return "npm"
+    return command
+
+
+def _preferred_distribution(agent_config: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    distribution = agent_config.get("distribution")
+    if not isinstance(distribution, dict):
+        if "command" in agent_config:
+            return "legacy", agent_config
+        raise RuntimeError(f"Agent '{agent_config.get('id', 'unknown')}' has no distribution")
+
+    for kind in ("npx", "uvx", "binary"):
+        value = distribution.get(kind)
+        if isinstance(value, dict):
+            return kind, value
+    raise RuntimeError(f"Agent '{agent_config.get('id', 'unknown')}' has no supported distribution")
+
+
+def _normalize_binary_relative_path(command: str) -> Path:
+    cleaned = command.strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    while cleaned.startswith("/"):
+        cleaned = cleaned[1:]
+    return Path(*[part for part in cleaned.split("/") if part and part != "."])
+
+
+def _binary_install_root(agent_id: str, version: str, platform_key: str) -> Path:
+    return Path(resolve_state_dir()) / "agents" / agent_id / version / platform_key
+
+
+def _expected_binary_command_path(agent_id: str, version: str, platform_key: str, command: str) -> Path:
+    return _binary_install_root(agent_id, version, platform_key) / _normalize_binary_relative_path(command)
+
+
+def _binary_archive_name(url: str) -> str:
+    path = urlparse(url).path
+    name = Path(path).name
+    return name or "agent-archive"
+
+
+def _split_package_spec(package_spec: str) -> tuple[str, str]:
+    package_spec = package_spec.strip()
+    if not package_spec:
+        raise RuntimeError("Package spec cannot be empty")
+
+    if package_spec.startswith("@"):
+        match = re.match(r"^(@[^/]+/[^@]+)(?:@(.+))?$", package_spec)
+        if not match:
+            raise RuntimeError(f"Unsupported package spec: {package_spec}")
+        return match.group(1), match.group(2) or "latest"
+
+    if "@" in package_spec:
+        name, version = package_spec.rsplit("@", 1)
+        return name, version or "latest"
+    return package_spec, "latest"
+
+
+def _sanitize_package_name(package_name: str) -> str:
+    return package_name.replace("@", "").replace("/", "__")
+
+
+async def _run_command_checked(
+    command: str,
+    args: list[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    log_prefix: str = "[cli]",
+) -> tuple[int, str, str]:
+    logger.info(f"{log_prefix} Running command: {command} {' '.join(args)}")
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    proc = await asyncio.create_subprocess_exec(
+        command,
+        *args,
+        cwd=cwd,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def _drain_stream(stream: asyncio.StreamReader | None, level: str) -> None:
+        if stream is None:
+            return
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").rstrip()
+            if not text:
+                continue
+            if level == "error":
+                stderr_chunks.append(text)
+            else:
+                stdout_chunks.append(text)
+            if level == "error":
+                logger.error(f"{log_prefix} {text}")
+            else:
+                logger.info(f"{log_prefix} {text}")
+
+    await asyncio.gather(
+        _drain_stream(proc.stdout, "info"),
+        _drain_stream(proc.stderr, "error"),
+    )
+    return_code = await proc.wait()
+    if return_code != 0:
+        raise RuntimeError(f"Command failed ({return_code}): {command} {' '.join(args)}")
+    logger.info(f"{log_prefix} Command finished successfully")
+    return return_code, "\n".join(stdout_chunks), "\n".join(stderr_chunks)
+
+
+async def _is_npx_package_installed(package_name: str) -> bool:
+    npm_command = _normalize_spawn_command("npm")
+    proc = await asyncio.create_subprocess_exec(
+        npm_command,
+        "list",
+        "-g",
+        package_name,
+        "--depth=0",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=os.environ.copy(),
+    )
+    return await proc.wait() == 0
+
+
+async def _ensure_npx_agent_installed(
+    agent_id: str,
+    agent_config: dict[str, Any],
+    package_spec: str,
+) -> None:
+    package_name, version = _split_package_spec(package_spec)
+    if not await _is_npx_package_installed(package_name):
+        npm_command = _normalize_spawn_command("npm")
+        logger.info(f"[cli] Installing npx agent: {agent_config.get('name', agent_id)} ({agent_id})")
+        logger.info(f"[cli] Package: {package_spec}")
+        await _run_command_checked(
+            npm_command,
+            ["install", "-g", package_spec],
+            env=os.environ.copy(),
+            log_prefix=f"[cli][install][{agent_id}]",
+        )
+        logger.info(f"[cli] Installed npx agent: {agent_config.get('name', agent_id)} ({agent_id})")
+    else:
+        logger.info(f"[cli] Using installed npx agent: {agent_config.get('name', agent_id)} ({agent_id})")
+
+
+def _extract_archive(archive_path: Path, destination: Path) -> None:
+    lower_name = archive_path.name.lower()
+    if lower_name.endswith(".zip"):
+        with zipfile.ZipFile(archive_path) as zf:
+            zf.extractall(destination)
+        return
+    if any(lower_name.endswith(ext) for ext in (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar")):
+        with tarfile.open(archive_path, "r:*") as tf:
+            tf.extractall(destination)
+        return
+    raise RuntimeError(f"Unsupported archive format: {archive_path.name}")
+
+
+def _ensure_executable(path: Path) -> None:
+    if platform.system() == "Windows" or not path.exists():
+        return
+    current_mode = path.stat().st_mode
+    path.chmod(current_mode | stat.S_IXUSR)
+
+
+async def _download_binary_archive(url: str, destination: Path) -> None:
+    timeout = aiohttp.ClientTimeout(total=300)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as response:
+            if response.status != 200:
+                body = await response.text()
+                raise RuntimeError(
+                    f"Download failed: status={response.status} url={url} body={body[:200]}"
+                )
+            destination.write_bytes(await response.read())
+
+
+async def _ensure_binary_agent_installed(
+    agent_id: str,
+    agent_config: dict[str, Any],
+    binary_distribution: dict[str, Any],
+) -> tuple[str, list[str], dict[str, str]]:
+    version = str(agent_config.get("version", "unknown")).strip() or "unknown"
+    platform_key = _detect_platform_key()
+    platform_distribution = binary_distribution.get(platform_key)
+    if not isinstance(platform_distribution, dict):
+        raise RuntimeError(f"Agent '{agent_id}' does not support platform '{platform_key}'")
+
+    command_rel = str(platform_distribution.get("cmd", "")).strip()
+    if not command_rel:
+        raise RuntimeError(f"Agent '{agent_id}' binary distribution for '{platform_key}' is missing 'cmd'")
+
+    install_root = _binary_install_root(agent_id, version, platform_key)
+    command_path = _expected_binary_command_path(agent_id, version, platform_key, command_rel)
+    if command_path.exists():
+        _ensure_executable(command_path)
+        return str(command_path), list(platform_distribution.get("args", [])), dict(platform_distribution.get("env", {}))
+
+    archive_url = str(platform_distribution.get("archive", "")).strip()
+    if not archive_url:
+        raise RuntimeError(
+            f"Agent '{agent_id}' binary distribution for '{platform_key}' is missing 'archive'"
+        )
+
+    install_root.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(
+        tempfile.mkdtemp(prefix=f"{agent_id}-{version}-", dir=str(install_root.parent))
+    )
+    archive_path = temp_dir / _binary_archive_name(archive_url)
+
+    try:
+        logger.info(f"[cli] Installing binary agent: {agent_config.get('name', agent_id)} ({agent_id})")
+        logger.info(f"[cli] Downloading archive: {archive_url}")
+        await _download_binary_archive(archive_url, archive_path)
+        _extract_archive(archive_path, temp_dir)
+
+        extracted_command = temp_dir / _normalize_binary_relative_path(command_rel)
+        if not extracted_command.exists():
+            raise RuntimeError(
+                f"Installed archive for agent '{agent_id}' did not contain expected command '{command_rel}'"
+            )
+
+        if install_root.exists():
+            shutil.rmtree(install_root)
+        shutil.move(str(temp_dir), str(install_root))
+        command_path = install_root / _normalize_binary_relative_path(command_rel)
+        _ensure_executable(command_path)
+        logger.info(f"[cli] Installed binary agent: {agent_config.get('name', agent_id)} ({agent_id})")
+        return str(command_path), list(platform_distribution.get("args", [])), dict(platform_distribution.get("env", {}))
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+async def resolve_agent_launch_config(agent_id: str, agent_config: dict[str, Any]) -> dict[str, Any]:
+    distribution_kind, distribution_value = _preferred_distribution(agent_config)
+    display_name = str(agent_config.get("name", agent_id))
+
+    if distribution_kind == "legacy":
+        return {
+            "agent_id": agent_id,
+            "display_name": display_name,
+            "distribution": distribution_kind,
+            "command": _normalize_spawn_command(str(agent_config.get("command", "")).strip()),
+            "args": list(agent_config.get("args", [])),
+            "env": dict(agent_config.get("env", {})),
+        }
+
+    if distribution_kind == "binary":
+        command, args, env = await _ensure_binary_agent_installed(
+            agent_id,
+            agent_config,
+            distribution_value,
+        )
+        return {
+            "agent_id": agent_id,
+            "display_name": display_name,
+            "distribution": distribution_kind,
+            "command": command,
+            "args": args,
+            "env": env,
+        }
+
+    package = str(distribution_value.get("package", "")).strip()
+    if not package:
+        raise RuntimeError(
+            f"Agent '{agent_id}' distribution '{distribution_kind}' is missing 'package'"
+        )
+    if distribution_kind == "npx":
+        await _ensure_npx_agent_installed(agent_id, agent_config, package)
+        package_name, _version = _split_package_spec(package)
+        command = _normalize_spawn_command("npx")
+    else:
+        command = _normalize_spawn_command("uvx")
+    return {
+        "agent_id": agent_id,
+        "display_name": display_name,
+        "distribution": distribution_kind,
+        "command": command,
+        "args": (
+            ["--no-install", package_name] if distribution_kind == "npx" else [package]
+        ) + list(distribution_value.get("args", [])),
+        "env": dict(distribution_value.get("env", {})),
+    }
 
 
 async def validate_weixin_account(account_id: str) -> tuple[bool, str]:
@@ -170,7 +537,7 @@ async def ensure_weixin_login(verbose: bool = False, force_login: bool = False) 
     account_ids = list_indexed_weixin_account_ids()
     if not account_ids:
         logger.info("No logged-in WeChat account detected, initiating login...")
-        logger.info(f"Wechat account not")
+        logger.info("Wechat account not")
         await perform_weixin_qr_login(verbose=verbose)
         return
 
@@ -192,15 +559,15 @@ def _cli_runtime_error(message: str) -> None:
     logger.info(f"[weixin] {message}")
 
 
-def _build_monitor_runtime() -> dict:
+def _build_monitor_runtime() -> dict[str, Any]:
     return {
         "log": _cli_runtime_log,
         "error": _cli_runtime_error,
     }
 
 
-def _load_logged_in_accounts() -> list[tuple[str, dict]]:
-    accounts: list[tuple[str, dict]] = []
+def _load_logged_in_accounts() -> list[tuple[str, dict[str, Any]]]:
+    accounts: list[tuple[str, dict[str, Any]]] = []
     for account_id in list_indexed_weixin_account_ids():
         account_data = load_weixin_account(account_id)
         if not account_data:
@@ -240,26 +607,29 @@ async def start_cli_monitors() -> list[asyncio.Task]:
 
 
 async def spawn_external_agent(
-    agent_name: str,
-    agent_config: dict,
+    agent_id: str,
+    agent_config: dict[str, Any],
     cwd: Optional[str] = None,
 ) -> asyncio.subprocess.Process:
     """Start and initialize the external ACP agent bridge."""
     from src.agent.agent import connect_external_agent
 
-    command = agent_config.get("command")
-    args = agent_config.get("args", [])
-    env = agent_config.get("env", {})
+    launch_config = await resolve_agent_launch_config(agent_id, agent_config)
+    command = str(launch_config.get("command", "")).strip()
+    args = list(launch_config.get("args", []))
+    env = dict(launch_config.get("env", {}))
+    display_name = str(launch_config.get("display_name", agent_id))
 
     if not command:
-        logger.error(f"[cli] No command specified for agent: {agent_name}")
+        logger.error(f"[cli] No command specified for agent: {display_name} ({agent_id})")
         sys.exit(1)
 
-    # Use provided cwd or current directory
     work_dir = cwd or os.getcwd()
 
-    logger.info(f"[cli] Spawning external agent: {agent_name}")
-    logger.info(f"[cli] Command: {command} {' '.join(args)}")
+    logger.info(f"[cli] Spawning external agent: {display_name} ({agent_id})")
+    logger.info(
+        f"[cli] Distribution: {launch_config.get('distribution')} | Command: {command} {' '.join(args)}"
+    )
     logger.info(f"[cli] Working directory: {work_dir}")
 
     full_env = {**os.environ, **env}
@@ -271,10 +641,10 @@ async def spawn_external_agent(
             env=full_env,
         )
     except Exception as err:
-        logger.error(f"[cli] Failed to start ACP client for {agent_name}: {err}")
+        logger.error(f"[cli] Failed to start ACP client for {display_name} ({agent_id}): {err}")
         raise
 
-    logger.info(f"[cli] ACP client ready for {agent_name}")
+    logger.info(f"[cli] ACP client ready for {display_name} ({agent_id})")
     return proc
 
 
@@ -289,9 +659,8 @@ def create_parser() -> argparse.ArgumentParser:
         "--agent",
         "-a",
         type=str,
-        default="Claude Code",
-        choices=["Claude Code", "Gemini CLI", "GitHub Copilot", "Qwen Code", "Auggie CLI", "Qoder CLI", "Codex CLI", "OpenCode", "OpenClaw"],
-        help="Agent to use (default: Claude Code)",
+        default=DEFAULT_AGENT_ID,
+        help=f"Official agent id to use (default: {DEFAULT_AGENT_ID})",
     )
 
     parser.add_argument(
@@ -339,24 +708,23 @@ async def main_async(args: argparse.Namespace) -> None:
     agent_proc: asyncio.subprocess.Process | None = None
 
     if args.list_agents:
-        agents = list_available_agents(config_path)
         logger.info("Available agents:")
-        for name in agents:
-            logger.info(f"  - {name}")
+        for agent_id, name in list_available_agent_entries(config_path):
+            logger.info(f"  - {agent_id}: {name}")
         return
 
-    agent_name = args.agent
+    agent_id = str(args.agent).strip()
     monitor_tasks: list[asyncio.Task] = []
 
     try:
-        agent_config = agents_config.get("agents", {}).get(agent_name)
+        agent_config = agents_config.get("agents", {}).get(agent_id)
         if not agent_config:
-            logger.error(f"[cli] Agent '{agent_name}' not found in config")
-            logger.error(f"[cli] Use --list-agents to see available agents")
+            logger.error(f"[cli] Agent '{agent_id}' not found in config")
+            logger.error("[cli] Use --list-agents to see available agents")
             sys.exit(1)
 
-        agent_proc = await spawn_external_agent(agent_name, agent_config, cwd=args.cwd)
-        await ensure_weixin_login(verbose=args.verbose, force_login=args.login)
+        agent_proc = await spawn_external_agent(agent_id, agent_config, cwd=args.cwd)
+        await ensure_weixin_login(verbose=args.verbose, force_login=getattr(args, "login", False))
         monitor_tasks = await start_cli_monitors()
         if agent_proc.returncode is None:
             await agent_proc.wait()
@@ -369,7 +737,7 @@ async def main_async(args: argparse.Namespace) -> None:
         try:
             from src.agent.agent import clear_bridge_state
         except Exception:
-            clear_bridge_state = None  # type: ignore
+            clear_bridge_state = None  # type: ignore[assignment]
         for task in monitor_tasks:
             task.cancel()
         if monitor_tasks:
@@ -386,7 +754,6 @@ def main() -> None:
     parser = create_parser()
     args = parser.parse_args()
 
-    # Run async main
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:
@@ -396,7 +763,8 @@ def main() -> None:
         logger.error(f"[cli] Error: {e}")
         if "--verbose" in sys.argv or "-v" in sys.argv:
             import traceback
-            traceback.logger.info_exc()
+
+            traceback.print_exc()
         sys.exit(1)
 
 
