@@ -166,7 +166,7 @@ async def api_post_fetch(
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, data=body.encode("utf-8"), headers=hdrs) as res:
             raw_text = await res.text()
-            logger.info(f"{label} status={res.status} raw={redact_body(raw_text[:200])}")
+            logger.debug(f"{label} status={res.status} raw={redact_body(raw_text[:200])}")
             if not res.ok:
                 raise RuntimeError(f"{label} {res.status}: {raw_text}")
             return raw_text
