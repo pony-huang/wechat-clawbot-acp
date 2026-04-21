@@ -195,7 +195,7 @@ async def get_updates(
         )
         return t.GetUpdatesResp.model_validate_json(raw_text)
     except asyncio.TimeoutError:
-        logger.info(f"getUpdates: client-side timeout after {timeout}ms, returning empty response")
+        logger.warn(f"getUpdates: client-side timeout after {timeout}ms, returning empty response")
         return t.GetUpdatesResp(ret=0, msgs=[], get_updates_buf=get_updates_buf)
 
 
