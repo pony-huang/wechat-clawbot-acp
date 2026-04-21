@@ -581,7 +581,7 @@ def _load_logged_in_accounts() -> list[tuple[str, dict[str, Any]]]:
 
 async def start_cli_monitors() -> list[asyncio.Task]:
     """Start background Weixin monitors so inbound receipt is visible in the terminal."""
-    from src.monitor.monitor import monitor_weixin_provider
+    from src.polling.monitor import monitor_weixin_provider
 
     tasks: list[asyncio.Task] = []
     for account_id, account_data in _load_logged_in_accounts():

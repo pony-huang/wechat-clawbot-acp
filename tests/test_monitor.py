@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from src.api.types import GetUpdatesResp, MessageItem, MessageItemType, TextItem, WeixinMessage
-from src.monitor.monitor import monitor_weixin_provider
+from src.polling.monitor import monitor_weixin_provider
 
 
 class TestMonitorWeixinProvider:

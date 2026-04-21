@@ -1,7 +1,7 @@
 """CDN download with AES-128-ECB decryption."""
 import base64
-from src.cdn.aes_ecb import decrypt_aes_ecb
-from src.cdn.cdn_url import ENABLE_CDN_URL_FALLBACK, build_cdn_download_url
+from src.media_ops.aes_ecb import decrypt_aes_ecb
+from src.media_ops.cdn_url import ENABLE_CDN_URL_FALLBACK, build_cdn_download_url
 from src.util.logger import logger
 
 # Use aiohttp for async fetch

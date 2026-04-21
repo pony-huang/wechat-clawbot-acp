@@ -1,12 +1,12 @@
 """Send media file: upload local file and send as Weixin message."""
 import os
 
-from src.cdn.upload import (
+from src.media_ops.upload import (
     upload_file_attachment_to_weixin,
     upload_file_to_weixin,
     upload_video_to_weixin,
 )
-from src.media.mime import get_mime_from_filename
+from src.media_ops.mime import get_mime_from_filename
 from src.messaging.send import (
     send_file_message_weixin,
     send_image_message_weixin,

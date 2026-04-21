@@ -46,7 +46,7 @@ from acp.schema import (
     WriteTextFileResponse, DeniedOutcome, AllowedOutcome,
 )
 
-from src.cdn.upload import download_remote_image_to_temp
+from src.media_ops.upload import download_remote_image_to_temp
 from src.messaging.error_notice import send_weixin_error_notice
 from src.messaging.send import send_message_weixin
 from src.messaging.send_media import send_weixin_media_file

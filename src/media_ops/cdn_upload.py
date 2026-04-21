@@ -1,8 +1,8 @@
 """CDN HTTP upload with AES-128-ECB encryption and retry logic."""
 import aiohttp
 
-from src.cdn.aes_ecb import encrypt_aes_ecb
-from src.cdn.cdn_url import build_cdn_upload_url
+from src.media_ops.aes_ecb import encrypt_aes_ecb
+from src.media_ops.cdn_url import build_cdn_upload_url
 from src.util.logger import logger
 from src.util.redact import redact_url
 

@@ -183,4 +183,4 @@ async def send_file_message_weixin(
     return await _send_media_items(to, text, file_item, opts, "sendFileMessageWeixin")
 
 
-from src.cdn.upload import UploadedFileInfo
+from src.media_ops.upload import UploadedFileInfo

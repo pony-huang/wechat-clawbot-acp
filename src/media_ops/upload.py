@@ -9,9 +9,9 @@ import aiohttp
 import aiofiles
 
 from src.api.client import get_upload_url
-from src.cdn.aes_ecb import aes_ecb_padded_size
-from src.cdn.cdn_upload import upload_buffer_to_cdn
-from src.media.mime import get_extension_from_content_type_or_url
+from src.media_ops.aes_ecb import aes_ecb_padded_size
+from src.media_ops.cdn_upload import upload_buffer_to_cdn
+from src.media_ops.mime import get_extension_from_content_type_or_url
 from src.util.logger import logger
 from src.util.random import temp_file_name
 

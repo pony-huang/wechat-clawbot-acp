@@ -1,7 +1,7 @@
 """Unit tests for silk_transcode module."""
 import pytest
 
-from src.media.silk_transcode import _pcm_bytes_to_wav
+from src.media_ops.silk_transcode import _pcm_bytes_to_wav
 
 
 class TestPcmToWav:

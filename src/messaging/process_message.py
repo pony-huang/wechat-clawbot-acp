@@ -6,7 +6,7 @@ using session_update() to send responses back to the ACP host.
 
 from src.api.client import send_typing
 from src.api.types import MessageItemType, TypingStatus
-from src.media.media_download import download_media_from_item
+from src.media_ops.media_download import download_media_from_item
 from src.messaging.inbound import (
     WeixinInboundMediaOpts,
     get_context_token_from_msg_context,

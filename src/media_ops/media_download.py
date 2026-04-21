@@ -1,8 +1,8 @@
 """Download and decrypt media from Weixin MessageItem (IMAGE/VOICE/FILE/VIDEO)."""
 from src.api.types import MessageItemType
-from src.cdn.pic_decrypt import download_and_decrypt_buffer, download_plain_cdn_buffer
-from src.media.mime import get_mime_from_filename
-from src.media.silk_transcode import silk_to_wav
+from src.media_ops.pic_decrypt import download_and_decrypt_buffer, download_plain_cdn_buffer
+from src.media_ops.mime import get_mime_from_filename
+from src.media_ops.silk_transcode import silk_to_wav
 from src.util.logger import logger
 
 WEIXIN_MEDIA_MAX_BYTES = 100 * 1024 * 1024
